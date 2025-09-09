@@ -1,10 +1,9 @@
 import os
 import io
 import re
-import requests
 from flask import Flask, request, send_file, jsonify
 from docx import Document
-from docx.shared import Inches
+from docx.shared import RGBColor
 
 app = Flask(__name__)
 
@@ -12,32 +11,32 @@ app = Flask(__name__)
 def health():
     return jsonify({"ok": True})
 
-# ------------ Utilidades Markdown -> DOCX ----------------
+# ------------ Utilidades Markdown -> DOCX (sin imágenes) ----------------
 
 HEADING_RE = re.compile(r'^(#{1,6})\s+(.*)$')
-UL_RE = re.compile(r'^\s*[-*+]\s+(.*)$')
-OL_RE = re.compile(r'^\s*\d+\.\s+(.*)$')
-IMG_RE = re.compile(r'!\[[^\]]*\]\(([^)]+)\)')  # ![alt](url)
-TABLE_ROW_RE = re.compile(r'^\s*\|(.+)\|\s*$')
+UL_RE      = re.compile(r'^\s*[-*+]\s+(.*)$')
+OL_RE      = re.compile(r'^\s*\d+\.\s+(.*)$')
+TABLE_ROW_RE   = re.compile(r'^\s*\|(.+)\|\s*$')
 TABLE_ALIGN_RE = re.compile(r'^\s*\|?\s*(:?-{3,}:?\s*\|)+\s*(:?-{3,}:?)\s*\|?\s*$')
+
+def force_styles_black(doc: Document):
+    """Pone el color de fuente a negro en estilos usados (encabezados, normal, listas)."""
+    target_styles = ["Normal", "List Paragraph", "List Bullet", "List Number"]
+    target_styles += [f"Heading {i}" for i in range(1, 10)]
+    for name in target_styles:
+        try:
+            style = doc.styles[name]
+            if style and style.font:
+                style.font.color.rgb = RGBColor(0, 0, 0)
+        except KeyError:
+            # Si el estilo no existe en esta plantilla, seguimos
+            pass
 
 def add_paragraph(doc, text):
     if not text.strip():
         doc.add_paragraph("")  # línea en blanco
-        return
-    # Si hay imágenes inline en el párrafo, colócalas antes/después (Word no soporta inline igual que MD)
-    imgs = IMG_RE.findall(text)
-    clean = IMG_RE.sub("", text).strip()
-    if clean:
-        doc.add_paragraph(clean)
-    for url in imgs:
-        try:
-            r = requests.get(url, timeout=12)
-            r.raise_for_status()
-            stream = io.BytesIO(r.content)
-            doc.add_picture(stream, width=Inches(4))
-        except Exception as e:
-            doc.add_paragraph(f"[Imagen no insertada: {url} ({e})]")
+    else:
+        p = doc.add_paragraph(text)
 
 def flush_list(doc, buf, ordered):
     if not buf:
@@ -51,11 +50,7 @@ def flush_table(doc, rows):
     if not rows:
         return
     # Ignora fila de alineación tipo | :-- | --- | :--: |
-    filtered = []
-    for r in rows:
-        if TABLE_ALIGN_RE.match(r):
-            continue
-        filtered.append(r)
+    filtered = [r for r in rows if not TABLE_ALIGN_RE.match(r)]
     if not filtered:
         return
     matrix = []
@@ -76,6 +71,7 @@ def flush_table(doc, rows):
 
 def markdown_to_doc(md_text, filename="output.docx"):
     doc = Document()
+    force_styles_black(doc)
 
     lines = md_text.splitlines()
     ul_buf, ol_buf, tbl_buf = [], [], []
@@ -114,7 +110,7 @@ def markdown_to_doc(md_text, filename="output.docx"):
             level = len(m.group(1))
             text = m.group(2).strip()
             level = min(max(level, 1), 9)
-            doc.add_heading(text, level=level)
+            h = doc.add_heading(text, level=level)
             continue
 
         # listas
@@ -148,6 +144,9 @@ def markdown_to_doc(md_text, filename="output.docx"):
     if tbl_buf:
         flush_table(doc, tbl_buf)
 
+    # Asegura estilos negros tras crear contenido (por si Word reintroduce colores por tema)
+    force_styles_black(doc)
+
     buf = io.BytesIO()
     doc.save(buf)
     buf.seek(0)
@@ -165,13 +164,13 @@ def make_docx():
     data = request.get_json(silent=True) or {}
     filename = data.get("filename", "output.docx")
 
-    if "markdown" in data and data["markdown"]:
+    if data.get("markdown"):
         buf, fname = markdown_to_doc(data["markdown"], filename)
     else:
-        # Compatibilidad con tu versión inicial: mete 'text' como un único párrafo
-        text = data.get("text", "")
+        # compat: texto plano en un párrafo
         doc = Document()
-        add_paragraph(doc, text)
+        force_styles_black(doc)
+        add_paragraph(doc, data.get("text", ""))
         buf = io.BytesIO()
         doc.save(buf)
         buf.seek(0)
@@ -187,3 +186,4 @@ def make_docx():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
