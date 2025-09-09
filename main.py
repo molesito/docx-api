@@ -1,11 +1,9 @@
 import os
 import io
 import re
-import base64
-import requests
 from flask import Flask, request, send_file, jsonify
 from docx import Document
-from docx.shared import Inches, RGBColor
+from docx.shared import RGBColor
 
 app = Flask(__name__)
 
@@ -13,17 +11,16 @@ app = Flask(__name__)
 def health():
     return jsonify({"ok": True})
 
-# ----------------- Regex y utilidades -----------------
+# ------------ Utilidades Markdown -> DOCX (sin imágenes) ----------------
 
-HEADING_RE     = re.compile(r'^(#{1,6})\s+(.*)$')
-UL_RE          = re.compile(r'^\s*[-*+]\s+(.*)$')
-OL_RE          = re.compile(r'^\s*\d+\.\s+(.*)$')
+HEADING_RE = re.compile(r'^(#{1,6})\s+(.*)$')
+UL_RE      = re.compile(r'^\s*[-*+]\s+(.*)$')
+OL_RE      = re.compile(r'^\s*\d+\.\s+(.*)$')
 TABLE_ROW_RE   = re.compile(r'^\s*\|(.+)\|\s*$')
 TABLE_ALIGN_RE = re.compile(r'^\s*\|?\s*(:?-{3,}:?\s*\|)+\s*(:?-{3,}:?)\s*\|?\s*$')
-IMG_RE         = re.compile(r'!\[[^\]]*\]\(([^)]+)\)')  # ![alt](target)
 
 def force_styles_black(doc: Document):
-    """Fuerza color negro en estilos habituales (títulos, normal, listas)."""
+    """Pone el color de fuente a negro en estilos usados (encabezados, normal, listas)."""
     target_styles = ["Normal", "List Paragraph", "List Bullet", "List Number"]
     target_styles += [f"Heading {i}" for i in range(1, 10)]
     for name in target_styles:
@@ -32,58 +29,27 @@ def force_styles_black(doc: Document):
             if style and style.font:
                 style.font.color.rgb = RGBColor(0, 0, 0)
         except KeyError:
+            # Si el estilo no existe en esta plantilla, seguimos
             pass
 
-def add_paragraph(doc: Document, text: str, images_map: dict):
-    """
-    Inserta el párrafo y, si hay ![](...), coloca imágenes.
-    targets soportados:
-      - http/https → se descargan
-      - 'img-X.jpeg' → se busca en images_map
-    """
-    images_map = images_map or {}
+def add_paragraph(doc, text):
+    if not text.strip():
+        doc.add_paragraph("")  # línea en blanco
+    else:
+        p = doc.add_paragraph(text)
 
-    targets = IMG_RE.findall(text)
-    clean_text = IMG_RE.sub("", text).strip()
-
-    if not clean_text and not targets:
-        doc.add_paragraph("")
-    elif clean_text:
-        doc.add_paragraph(clean_text)
-
-    for target in targets:
-        try:
-            if target.lower().startswith(("http://", "https://")):
-                r = requests.get(target, timeout=12)
-                r.raise_for_status()
-                stream = io.BytesIO(r.content)
-                doc.add_picture(stream, width=Inches(4))
-            else:
-                if target not in images_map:
-                    raise ValueError(f"imagen '{target}' no recibida")
-                stream = io.BytesIO(images_map[target])
-                doc.add_picture(stream, width=Inches(4))
-        except Exception as e:
-            doc.add_paragraph(f"[Imagen no insertada: {target} ({e})]")
-
-def flush_list(doc: Document, buf: list, ordered: bool, images_map: dict):
+def flush_list(doc, buf, ordered):
     if not buf:
         return
     style = "List Number" if ordered else "List Bullet"
     for item in buf:
-        # Renderizamos como párrafo de lista; si hay imágenes, se insertan después
-        p = doc.add_paragraph("", style=style)
-        p.add_run(item)
-        # Si el ítem tuviera ![](...), renderízalo aparte:
-        tmp = Document()
-        add_paragraph(tmp, item, images_map)
-        for extra in tmp.paragraphs[1:]:
-            doc.add_paragraph(extra.text)
+        doc.add_paragraph(item, style=style)
     buf.clear()
 
-def flush_table(doc: Document, rows: list):
+def flush_table(doc, rows):
     if not rows:
         return
+    # Ignora fila de alineación tipo | :-- | --- | :--: |
     filtered = [r for r in rows if not TABLE_ALIGN_RE.match(r)]
     if not filtered:
         return
@@ -103,7 +69,7 @@ def flush_table(doc: Document, rows: list):
         for j in range(cols):
             table.cell(i, j).text = row[j] if j < len(row) else ""
 
-def markdown_to_doc(md_text: str, images_map: dict = None):
+def markdown_to_doc(md_text, filename="output.docx"):
     doc = Document()
     force_styles_black(doc)
 
@@ -114,22 +80,23 @@ def markdown_to_doc(md_text: str, images_map: dict = None):
 
     def flush_para():
         if para_buf:
-            add_paragraph(doc, " ".join(para_buf).strip(), images_map)
+            add_paragraph(doc, " ".join(para_buf).strip())
             para_buf.clear()
 
     for raw in lines:
         line = raw.rstrip("\n")
 
-        # tablas
+        # tablas (líneas que empiezan/terminan con |)
         if TABLE_ROW_RE.match(line):
             in_table = True
             tbl_buf.append(line)
             continue
         else:
             if in_table:
+                # cierra tabla al salir del bloque
                 flush_para()
-                flush_list(doc, ul_buf, ordered=False, images_map=images_map)
-                flush_list(doc, ol_buf, ordered=True, images_map=images_map)
+                flush_list(doc, ul_buf, ordered=False)
+                flush_list(doc, ol_buf, ordered=True)
                 flush_table(doc, tbl_buf)
                 tbl_buf = []
                 in_table = False
@@ -138,11 +105,12 @@ def markdown_to_doc(md_text: str, images_map: dict = None):
         m = HEADING_RE.match(line)
         if m:
             flush_para()
-            flush_list(doc, ul_buf, ordered=False, images_map=images_map)
-            flush_list(doc, ol_buf, ordered=True, images_map=images_map)
-            level = min(max(len(m.group(1)), 1), 9)
+            flush_list(doc, ul_buf, ordered=False)
+            flush_list(doc, ol_buf, ordered=True)
+            level = len(m.group(1))
             text = m.group(2).strip()
-            doc.add_heading(text, level=level)
+            level = min(max(level, 1), 9)
+            h = doc.add_heading(text, level=level)
             continue
 
         # listas
@@ -150,113 +118,71 @@ def markdown_to_doc(md_text: str, images_map: dict = None):
         m_ol = OL_RE.match(line)
         if m_ul:
             flush_para()
-            flush_list(doc, ol_buf, ordered=True, images_map=images_map)
+            flush_list(doc, ol_buf, ordered=True)
             ul_buf.append(m_ul.group(1).strip())
             continue
         if m_ol:
             flush_para()
-            flush_list(doc, ul_buf, ordered=False, images_map=images_map)
+            flush_list(doc, ul_buf, ordered=False)
             ol_buf.append(m_ol.group(1).strip())
             continue
 
-        # separación
+        # separación de párrafos
         if not line.strip():
             flush_para()
-            flush_list(doc, ul_buf, ordered=False, images_map=images_map)
-            flush_list(doc, ol_buf, ordered=True, images_map=images_map)
+            flush_list(doc, ul_buf, ordered=False)
+            flush_list(doc, ol_buf, ordered=True)
             continue
 
-        # texto normal
+        # texto normal (acumula para párrafo)
         para_buf.append(line.strip())
 
+    # flush final
     flush_para()
-    flush_list(doc, ul_buf, ordered=False, images_map=images_map)
-    flush_list(doc, ol_buf, ordered=True, images_map=images_map)
+    flush_list(doc, ul_buf, ordered=False)
+    flush_list(doc, ol_buf, ordered=True)
     if tbl_buf:
         flush_table(doc, tbl_buf)
 
+    # Asegura estilos negros tras crear contenido (por si Word reintroduce colores por tema)
     force_styles_black(doc)
 
-    out = io.BytesIO()
-    doc.save(out)
-    out.seek(0)
-    return out
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf, filename
 
-# ----------------- Endpoint -----------------
+# -------------------- Endpoint principal --------------------
 
 @app.post("/docx")
 def make_docx():
     """
-    multipart/form-data:
-      - markdown (texto)
-      - filename (opcional)
-      - data0, data1, data2 ... (binarios). Se mapearán a:
-          dataN -> img-N.jpeg
-      - También acepta uploads con filename 'img-N.jpeg'.
-
-    application/json (opcional):
-      { "filename": "...", "markdown": "...", "images_map": { "img-0.jpeg": <bytes base64> } }
+    Acepta:
+      - {"markdown": "...", "filename": "informe.docx"}
+      - o {"text": "...", "filename": "..."} (compatibilidad)
     """
-    # Modo multipart: recomendado para n8n con data0..dataN
-    if request.content_type and request.content_type.startswith("multipart/form-data"):
-        md_text = request.form.get("markdown", "")
-        filename = request.form.get("filename", "output.docx")
-
-        images_map = {}
-        for fieldname, storage in request.files.items():
-            content = storage.read()
-            if not content:
-                continue
-
-            # 1) Si viene como dataN -> mapear a img-N.jpeg
-            m = re.match(r"data(\d+)$", fieldname)
-            if m:
-                key = f"img-{m.group(1)}.jpeg"
-                images_map[key] = content
-
-            # 2) Si el filename ya es 'img-N.jpeg', también guardarlo
-            if storage.filename:
-                images_map[storage.filename] = content
-
-            # 3) Por compatibilidad, también guarda el nombre del campo tal cual
-            images_map[fieldname] = content
-
-        buf = markdown_to_doc(md_text, images_map)
-        return send_file(
-            buf,
-            as_attachment=True,
-            download_name=filename,
-            mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        )
-
-    # Modo JSON (opcional)
     data = request.get_json(silent=True) or {}
     filename = data.get("filename", "output.docx")
-    md_text  = data.get("markdown", data.get("text", ""))
-    images_map_b64 = data.get("images_map") or {}
 
-    # Si vienen en base64 por JSON, decodifica
-    images_map = {}
-    for k, v in images_map_b64.items():
-        try:
-            if isinstance(v, (bytes, bytearray)):
-                images_map[k] = v
-            else:
-                if isinstance(v, str) and v.startswith("data:"):
-                    v = v.split(",", 1)[1]
-                images_map[k] = base64.b64decode(v)
-        except Exception:
-            pass
+    if data.get("markdown"):
+        buf, fname = markdown_to_doc(data["markdown"], filename)
+    else:
+        # compat: texto plano en un párrafo
+        doc = Document()
+        force_styles_black(doc)
+        add_paragraph(doc, data.get("text", ""))
+        buf = io.BytesIO()
+        doc.save(buf)
+        buf.seek(0)
+        fname = filename
 
-    buf = markdown_to_doc(md_text, images_map)
     return send_file(
         buf,
         as_attachment=True,
-        download_name=filename,
+        download_name=fname,
         mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     )
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
