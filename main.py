@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify, send_file
 from docx import Document
 import io
 import os
+import json
 
 app = Flask(__name__)
 
@@ -32,9 +33,12 @@ def replace_placeholders(doc: Document, campos: dict):
 @app.route("/fill-doc", methods=["POST"])
 def fill_doc():
     try:
-        # Recibir archivo y campos
+        # Recibir archivo desde form-data
         file = request.files.get("file")
-        campos = request.json.get("campos")
+
+        # Recibir campos como string JSON en form-data
+        campos_raw = request.form.get("campos")
+        campos = json.loads(campos_raw) if campos_raw else None
 
         if not file or not campos:
             return jsonify({"error": "Falta el archivo .docx o el campo 'campos'"}), 400
